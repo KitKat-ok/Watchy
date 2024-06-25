@@ -1,8 +1,8 @@
 #include "Watchy.h"
 
 WatchyRTC Watchy::RTC;
-GxEPD2_BW<WatchyDisplay, WatchyDisplay::HEIGHT> Watchy::display(
-    WatchyDisplay{});
+GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> Watchy::display(
+    GxEPD2_154_D67(DISPLAY_CS, DISPLAY_DC, DISPLAY_RES, DISPLAY_BUSY));
 
 RTC_DATA_ATTR int guiState;
 RTC_DATA_ATTR int menuIndex;
@@ -11,11 +11,7 @@ RTC_DATA_ATTR bool WIFI_CONFIGURED;
 RTC_DATA_ATTR bool BLE_CONFIGURED;
 RTC_DATA_ATTR weatherData currentWeather;
 RTC_DATA_ATTR int weatherIntervalCounter = -1;
-RTC_DATA_ATTR long gmtOffset = 0;
-RTC_DATA_ATTR bool alreadyInMenu         = true;
-RTC_DATA_ATTR tmElements_t bootTime;
-RTC_DATA_ATTR uint32_t lastIPAddress;
-RTC_DATA_ATTR char lastSSID[30];
+RTC_DATA_ATTR bool displayFullInit       = true;
 
 void Watchy::init(String datetime) {
   esp_sleep_wakeup_cause_t wakeup_reason;
@@ -23,31 +19,17 @@ void Watchy::init(String datetime) {
   Wire.begin(SDA, SCL);                         // init i2c
   RTC.init();
 
-  // Init the display since is almost sure we will use it
-  display.epd2.initWatchy();
+  // Init the display here for all cases, if unused, it will do nothing
+  display.epd2.selectSPI(SPI, SPISettings(20000000, MSBFIRST, SPI_MODE0)); // Set SPI to 20Mhz (default is 4Mhz)
+  display.init(0, displayFullInit, 10,
+               true); // 10ms by spec, and fast pulldown reset
+  display.epd2.setBusyCallback(displayBusyCallback);
 
   switch (wakeup_reason) {
   case ESP_SLEEP_WAKEUP_EXT0: // RTC Alarm
-    RTC.read(currentTime);
-    switch (guiState) {
-    case WATCHFACE_STATE:
+    if (guiState == WATCHFACE_STATE) {
+      RTC.read(currentTime);
       showWatchFace(true); // partial updates on tick
-      if (settings.vibrateOClock) {
-        if (currentTime.Minute == 0) {
-          // The RTC wakes us up once per minute
-          vibMotor(75, 4);
-        }
-      }
-      break;
-    case MAIN_MENU_STATE:
-      // Return to watchface if in menu for more than one tick
-      if (alreadyInMenu) {
-        guiState = WATCHFACE_STATE;
-        showWatchFace(false);
-      } else {
-        alreadyInMenu = true;
-      }
-      break;
     }
     break;
   case ESP_SLEEP_WAKEUP_EXT1: // button Press
@@ -56,19 +38,24 @@ void Watchy::init(String datetime) {
   default: // reset
     RTC.config(datetime);
     _bmaConfig();
-    gmtOffset = settings.gmtOffset;
     RTC.read(currentTime);
-    RTC.read(bootTime);
     showWatchFace(false); // full update on reset
-    vibMotor(75, 4);
-    // For some reason, seems to be enabled on first boot
-    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     break;
   }
   deepSleep();
 }
+
+void Watchy::displayBusyCallback(const void *) {
+  gpio_wakeup_enable((gpio_num_t)DISPLAY_BUSY, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_light_sleep_start();
+}
+
 void Watchy::deepSleep() {
   display.hibernate();
+  if (displayFullInit) // For some reason, seems to be enabled on first boot
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  displayFullInit = false; // Notify not to init it again
   RTC.clearAlarm();        // resets the alarm flag in the RTC
 
   // Set GPIOs 0-39 to input to avoid power leaking out
@@ -270,7 +257,6 @@ void Watchy::showMenu(byte menuIndex, bool partialRefresh) {
   display.display(partialRefresh);
 
   guiState = MAIN_MENU_STATE;
-  alreadyInMenu = false;
 }
 
 void Watchy::showFastMenu(byte menuIndex) {
@@ -315,37 +301,15 @@ void Watchy::showAbout() {
   display.print("LibVer: ");
   display.println(WATCHY_LIB_VER);
 
-  display.print("Rev: v");
-  display.println(getBoardRevision());
+  const char *RTC_HW[3] = {"<UNKNOWN>", "DS3231", "PCF8563"};
+  display.print("RTC: ");
+  display.println(RTC_HW[RTC.rtcType]); // 0 = UNKNOWN, 1 = DS3231, 2 = PCF8563
 
   display.print("Batt: ");
   float voltage = getBatteryVoltage();
   display.print(voltage);
   display.println("V");
 
-  display.print("Uptime: ");
-  RTC.read(currentTime);
-  time_t b = makeTime(bootTime);
-  time_t c = makeTime(currentTime);
-  int totalSeconds = c-b;
-  //int seconds = (totalSeconds % 60);
-  int minutes = (totalSeconds % 3600) / 60;
-  int hours = (totalSeconds % 86400) / 3600;
-  int days = (totalSeconds % (86400 * 30)) / 86400; 
-  display.print(days);
-  display.print("d");
-  display.print(hours);
-  display.print("h");
-  display.print(minutes);
-  display.println("m");    
-  if(WIFI_CONFIGURED){
-    display.print("SSID: ");
-    display.println(lastSSID);
-    display.print("IP: ");
-    display.println(IPAddress(lastIPAddress).toString());
-  }else{
-    display.println("WiFi Not Connected");
-  }
   display.display(false); // full refresh
 
   guiState = APP_STATE;
@@ -603,8 +567,6 @@ void Watchy::showAccelerometer() {
 
 void Watchy::showWatchFace(bool partialRefresh) {
   display.setFullWindow();
-  // At this point it is sure we are going to update
-  display.epd2.asyncPowerOn();
   drawWatchFace();
   display.display(partialRefresh); // partial refresh
   guiState = WATCHFACE_STATE;
@@ -625,71 +587,59 @@ void Watchy::drawWatchFace() {
 }
 
 weatherData Watchy::getWeatherData() {
-  return _getWeatherData(settings.cityID, settings.lat, settings.lon,
-    settings.weatherUnit, settings.weatherLang, settings.weatherURL,
-    settings.weatherAPIKey, settings.weatherUpdateInterval);
+  return getWeatherData(settings.cityID, settings.weatherUnit,
+                        settings.weatherLang, settings.weatherURL,
+                        settings.weatherAPIKey, settings.weatherUpdateInterval);
 }
 
-weatherData Watchy::_getWeatherData(String cityID, String lat, String lon, String units, String lang,
-                                   String url, String apiKey,
-                                   uint8_t updateInterval) {
-  currentWeather.isMetric = units == String("metric");
-  if (weatherIntervalCounter < 0) { //-1 on first run, set to updateInterval
-    weatherIntervalCounter = updateInterval;
-  }
-  if (weatherIntervalCounter >=
-      updateInterval) { // only update if WEATHER_UPDATE_INTERVAL has elapsed
-                        // i.e. 30 minutes
-    if (connectWiFi()) {
-      HTTPClient http; // Use Weather API for live data if WiFi is connected
-      http.setConnectTimeout(3000); // 3 second max timeout
-      String weatherQueryURL = url;
-      if(cityID != ""){
-        weatherQueryURL.replace("{cityID}", cityID);
-      }else{
-        weatherQueryURL.replace("{lat}", lat);
-        weatherQueryURL.replace("{lon}", lon);
-      }
-      weatherQueryURL.replace("{units}", units);
-      weatherQueryURL.replace("{lang}", lang);
-      weatherQueryURL.replace("{apiKey}", apiKey);
-      http.begin(weatherQueryURL.c_str());
-      int httpResponseCode = http.GET();
-      if (httpResponseCode == 200) {
-        String payload             = http.getString();
-        JSONVar responseObject     = JSON.parse(payload);
-        currentWeather.temperature = int(responseObject["main"]["temp"]);
-        currentWeather.weatherConditionCode =
-            int(responseObject["weather"][0]["id"]);
-        currentWeather.weatherDescription =
-		        JSONVar::stringify(responseObject["weather"][0]["main"]);
-	      currentWeather.external = true;
-		        breakTime((time_t)(int)responseObject["sys"]["sunrise"], currentWeather.sunrise);
-		        breakTime((time_t)(int)responseObject["sys"]["sunset"], currentWeather.sunset);
-        // sync NTP during weather API call and use timezone of lat & lon
-        gmtOffset = int(responseObject["timezone"]);
-        syncNTP(gmtOffset);
-      } else {
-        // http error
-      }
-      http.end();
-      // turn off radios
-      WiFi.mode(WIFI_OFF);
-      btStop();
-    } else { // No WiFi, use internal temperature sensor
-      uint8_t temperature = sensor.readTemperature(); // celsius
-      if (!currentWeather.isMetric) {
-        temperature = temperature * 9. / 5. + 32.; // fahrenheit
-      }
-      currentWeather.temperature          = temperature;
-      currentWeather.weatherConditionCode = 800;
-      currentWeather.external             = false;
+weatherData Watchy::getWeatherData(String cityID, String units, String lang, String url, String apiKey, uint8_t updateInterval) {
+    currentWeather.isMetric = units == String("metric");
+    if (weatherIntervalCounter < 0) { //-1 on first run, set to updateInterval
+        weatherIntervalCounter = updateInterval;
     }
-    weatherIntervalCounter = 0;
-  } else {
-    weatherIntervalCounter++;
-  }
-  return currentWeather;
+    if (weatherIntervalCounter >= updateInterval) { // only update if updateInterval has elapsed
+        if (connectWiFi()) {
+            HTTPClient http; // Use Weather API for live data if WiFi is connected
+            http.setConnectTimeout(3000); // 3 second max timeout
+            String weatherQueryURL = url + cityID + String("&units=") + units + String("&lang=") + lang + String("&appid=") + apiKey;
+            http.begin(weatherQueryURL.c_str());
+            int httpResponseCode = http.GET();
+            if (httpResponseCode == 200) {
+                String payload = http.getString();
+                JSONVar responseObject = JSON.parse(payload);
+                if (JSON.typeof(responseObject) == "undefined") {
+                    Serial.println("Parsing input failed!");
+                    // Handle JSON parsing error
+                } else {
+                    currentWeather.temperature = int(responseObject["main"]["temp"]);
+                    currentWeather.weatherConditionCode = int(responseObject["weather"][0]["id"]);
+                    currentWeather.weatherDescription = (const char*) responseObject["weather"][0]["main"];
+                    // sync NTP during weather API call and use timezone of city
+                    syncNTP(long(responseObject["timezone"]));
+                }
+            } else {
+                Serial.print("Error on HTTP request: ");
+                Serial.println(httpResponseCode);
+                // Handle HTTP error
+            }
+            http.end();
+            // turn off radios
+            WiFi.mode(WIFI_OFF);
+            btStop();
+        } else { // No WiFi, use internal temperature sensor
+            uint8_t temperature = sensor.readTemperature(); // celsius
+            if (!currentWeather.isMetric) {
+                temperature = temperature * 9. / 5. + 32.; // fahrenheit
+            }
+            currentWeather.temperature = temperature;
+            currentWeather.weatherConditionCode = 800; // Clear weather condition code
+            currentWeather.weatherDescription = "Clear"; // Default weather description
+        }
+        weatherIntervalCounter = 0;
+    } else {
+        weatherIntervalCounter++;
+    }
+    return currentWeather;
 }
 
 float Watchy::getBatteryVoltage() {
@@ -699,31 +649,6 @@ float Watchy::getBatteryVoltage() {
   } else {
     return analogReadMilliVolts(BATT_ADC_PIN) / 1000.0f * 2.0f;
   }
-}
-
-uint8_t Watchy::getBoardRevision() {
-  esp_chip_info_t chip_info;
-  esp_chip_info(&chip_info);
-  if(chip_info.model == CHIP_ESP32){ //Revision 1.0 - 2.0
-    Wire.beginTransmission(0x68); //v1.0 has DS3231
-    if (Wire.endTransmission() == 0){
-      return 10;
-    }
-    delay(1);
-    Wire.beginTransmission(0x51); //v1.5 and v2.0 have PCF8563
-    if (Wire.endTransmission() == 0){
-        pinMode(35, INPUT);
-        if(digitalRead(35) == 0){
-          return 20; //in rev 2.0, pin 35 is BTN 3 and has a pulldown
-        }else{
-          return 15; //in rev 1.5, pin 35 is the battery ADC
-        }
-    }
-  }
-  if(chip_info.model == CHIP_ESP32S3){ //Revision 3.0
-    return 30;
-  }
-  return -1;
 }
 
 uint16_t Watchy::_readRegister(uint8_t address, uint8_t reg, uint8_t *data,
@@ -857,20 +782,15 @@ void Watchy::setupWifi() {
     display.println("Setup failed &");
     display.println("timed out!");
   } else {
-    display.println("Connected to:");
+    display.println("Connected to");
     display.println(WiFi.SSID());
-		display.println("Local IP:");
-		display.println(WiFi.localIP());
-    weatherIntervalCounter = -1; // Reset to force weather to be read again
-    lastIPAddress = WiFi.localIP();
-    WiFi.SSID().toCharArray(lastSSID, 30);
   }
   display.display(false); // full refresh
   // turn off radios
   WiFi.mode(WIFI_OFF);
   btStop();
-  // enable lightsleep on busy
-  display.epd2.setBusyCallback(WatchyDisplay::busyCallback);
+  display.epd2.setBusyCallback(displayBusyCallback); // enable lightsleep on
+                                                     // busy
   guiState = APP_STATE;
 }
 
@@ -885,8 +805,6 @@ void Watchy::_configModeCallback(WiFiManager *myWiFiManager) {
   display.println(WIFI_AP_SSID);
   display.print("IP: ");
   display.println(WiFi.softAPIP());
-	display.println("MAC address:");
-	display.println(WiFi.softAPmacAddress().c_str());
   display.display(false); // full refresh
 }
 
@@ -898,8 +816,6 @@ bool Watchy::connectWiFi() {
   } else {
     if (WL_CONNECTED ==
         WiFi.waitForConnectResult()) { // attempt to connect for 10s
-      lastIPAddress = WiFi.localIP();
-      WiFi.SSID().toCharArray(lastSSID, 30);
       WIFI_CONFIGURED = true;
     } else { // connection failed, time out
       WIFI_CONFIGURED = false;
@@ -1024,8 +940,6 @@ void Watchy::showSyncNTP() {
   display.setTextColor(GxEPD_WHITE);
   display.setCursor(0, 30);
   display.println("Syncing NTP... ");
-  display.print("GMT offset: ");
-  display.println(gmtOffset);
   display.display(false); // full refresh
   if (connectWiFi()) {
     if (syncNTP()) {
@@ -1063,7 +977,7 @@ void Watchy::showSyncNTP() {
 
 bool Watchy::syncNTP() { // NTP sync - call after connecting to WiFi and
                          // remember to turn it back off
-  return syncNTP(gmtOffset,
+  return syncNTP(settings.gmtOffset,
                  settings.ntpServer.c_str());
 }
 
